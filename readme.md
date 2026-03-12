@@ -145,6 +145,46 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+**搜索结果显示示例**：
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $GROK2API_API_KEY" \
+  -d '{
+    "model": "grok-4",
+    "messages": [{"role":"user","content":"特朗普最近在做什么"}],
+    "search_details": "medium"
+  }'
+```
+
+响应将在末尾包含格式化的搜索结果：
+
+```markdown
+[Grok 的回答内容...]
+
+
+## Sources:
+
+### 网页搜索结果
+
+- **[标题1](url1):**
+  预览描述1
+
+- **[标题2](url2):**
+  预览描述2
+
+### X 搜索结果
+
+> **用户名1** (@username1)
+> 帖子内容1
+> 📅 2026-03-12 | 👁️ 1.2M views | [查看原帖](链接1)
+
+> **用户名2** (@username2)
+> 帖子内容2
+> 📅 2026-03-12 | 👁️ 500K views | [查看原帖](链接2)
+```
+
 <details>
 <summary>支持的请求参数</summary>
 
@@ -158,6 +198,7 @@ curl http://localhost:8000/v1/chat/completions \
 | `reasoning_effort` | string | 推理强度 | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` |
 | `temperature` | number | 采样温度 | `0` ~ `2` |
 | `top_p` | number | nucleus 采样 | `0` ~ `1` |
+| `search_details` | string | 搜索结果显示级别 | `none` (不显示), `medium` (精简5条), `full` (全部显示) |
 | `tools` | array | 工具定义 | OpenAI function tools |
 | `tool_choice` | string/object | 工具选择 | `auto`, `required`, `none` 或指定工具 |
 | `parallel_tool_calls` | boolean | 是否允许并行工具调用 | `true`, `false` |
@@ -191,6 +232,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 - `image_url/input_audio/file` 仅支持 URL 或 Data URI（`data:<mime>;base64,...`），裸 base64 会报错。
 - `reasoning_effort`：`none` 表示不输出思考，其他值都会输出思考内容。
+- `search_details`：控制搜索结果的显示方式，默认为 `none` 不显示。当设置为 `medium` 或 `full` 时，会在响应末尾以 Markdown 格式追加 `## Sources:` 部分，包含网页搜索结果和 X/Twitter 搜索结果。`medium` 模式最多显示 5 条结果，`full` 模式显示所有结果。
 - 工具调用为**提示词模拟 + 客户端执行回填**：模型通过 `<tool_call>{...}</tool_call>` 输出调用请求，服务端解析为 `tool_calls`；不执行工具。
 - `grok-imagine-1.0-fast` 与瀑布流 imagine 生成链路一致，可直接通过 `/v1/chat/completions` 调用；其 `n/size/response_format` 由服务端 `[imagine_fast]` 统一控制。
 - `grok-imagine-1.0-fast` 在 `/v1/chat/completions` 的流式输出仅返回最终成图，不返回中间预览图。

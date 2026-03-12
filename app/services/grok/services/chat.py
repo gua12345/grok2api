@@ -390,6 +390,7 @@ class ChatService:
         tools: List[Dict[str, Any]] = None,
         tool_choice: Any = None,
         parallel_tool_calls: bool = True,
+        search_details: str = "none",  # 新增：搜索结果显示级别
     ):
         """Chat Completions 入口"""
         # 获取 token
@@ -442,14 +443,14 @@ class ChatService:
                 # 处理响应
                 if is_stream:
                     logger.debug(f"Processing stream response: model={model}")
-                    processor = StreamProcessor(model_name, token, show_think, tools=tools, tool_choice=tool_choice)
+                    processor = StreamProcessor(model_name, token, show_think, tools=tools, tool_choice=tool_choice, search_details=search_details)
                     return wrap_stream_with_usage(
                         processor.process(response), token_mgr, token, model
                     )
 
                 # 非流式
                 logger.debug(f"Processing non-stream response: model={model}")
-                result = await CollectProcessor(model_name, token, tools=tools, tool_choice=tool_choice).process(response)
+                result = await CollectProcessor(model_name, token, tools=tools, tool_choice=tool_choice, search_details=search_details).process(response)
                 try:
                     model_info = ModelService.get(model)
                     effort = (
@@ -506,7 +507,7 @@ class ChatService:
 class StreamProcessor(proc_base.BaseProcessor):
     """Stream response processor."""
 
-    def __init__(self, model: str, token: str = "", show_think: bool = None, tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
+    def __init__(self, model: str, token: str = "", show_think: bool = None, tools: List[Dict[str, Any]] = None, tool_choice: Any = None, search_details: str = "none"):
         super().__init__(model, token)
         self.response_id: str = None
         self.fingerprint: str = ""
@@ -531,6 +532,8 @@ class StreamProcessor(proc_base.BaseProcessor):
         self._tool_partial = ""
         self._tool_calls_seen = False
         self._tool_call_index = 0
+        self.search_details = search_details  # 新增：搜索结果显示级别
+        self.tool_usage_results = []  # 新增：收集工具使用结果
 
     def _with_tool_index(self, tool_call: Any) -> Any:
         if not isinstance(tool_call, dict):
@@ -540,6 +543,62 @@ class StreamProcessor(proc_base.BaseProcessor):
             tool_call["index"] = self._tool_call_index
             self._tool_call_index += 1
         return tool_call
+
+    def _format_sources_section(self, tool_results: list) -> str:
+        """格式化Sources部分
+
+        根据 search_details 参数决定显示数量：
+        - "none": 不显示，返回空字符串
+        - "medium": X帖子5条，网页5条
+        - "full": 全部显示
+        """
+        if self.search_details == "none":
+            return ""
+
+        from app.services.grok.utils.response import (
+            format_x_search_results,
+            format_web_search_results
+        )
+
+        # 确定最大显示数量
+        max_count = 5 if self.search_details == "medium" else None
+
+        # 收集所有搜索结果
+        all_web_results = []
+        all_x_results = []
+
+        for result in tool_results:
+            # 收集网页搜索结果
+            if "webSearchResults" in result:
+                web_results = result["webSearchResults"].get("results", [])
+                if web_results:
+                    all_web_results.extend(web_results)
+
+            # 收集X搜索结果
+            if "xSearchResults" in result:
+                x_results = result["xSearchResults"].get("results", [])
+                if x_results:
+                    all_x_results.extend(x_results)
+
+        # 格式化结果
+        sections = ["\n\n## Sources:\n"]
+        has_content = False
+
+        # 先处理网页搜索结果（优先显示）
+        if all_web_results:
+            web_md = format_web_search_results(all_web_results, max_count)
+            if web_md:
+                sections.append(web_md)
+                has_content = True
+
+        # 再处理X搜索结果
+        if all_x_results:
+            x_md = format_x_search_results(all_x_results, max_count)
+            if x_md:
+                sections.append(x_md)
+                has_content = True
+
+        return "\n".join(sections) if has_content else ""
 
     def _filter_tool_card(self, token: str) -> str:
         if not token or not self.tool_usage_enabled:
@@ -768,11 +827,18 @@ class StreamProcessor(proc_base.BaseProcessor):
                     continue
 
                 if mr := resp.get("modelResponse"):
+                    # 收集 toolUsageResults
+                    if steps := mr.get("steps"):
+                        for step in steps:
+                            if tool_results := step.get("toolUsageResults"):
+                                self.tool_usage_results.extend(tool_results)
+
                     if self.image_think_active and self.think_opened:
                         yield self._sse("\n</think>\n")
                         self.think_opened = False
                         self.think_closed_once = True
                     self.image_think_active = False
+
                     for url in proc_base._collect_images(mr):
                         parts = url.split("/")
                         img_id = parts[-2] if len(parts) >= 2 else "image"
@@ -851,6 +917,13 @@ class StreamProcessor(proc_base.BaseProcessor):
                 yield self._sse("</think>\n")
                 self.think_closed_once = True
 
+            # 在发送 finish_reason 之前，先发送 sources
+            if self.tool_usage_results and self.search_details != "none":
+                sources_md = self._format_sources_section(self.tool_usage_results)
+                if sources_md:
+                    # 发送sources部分（不带finish_reason）
+                    yield self._sse(sources_md)
+
             if self._tool_stream_enabled:
                 for kind, payload in self._flush_tool_stream():
                     if kind == "text":
@@ -902,11 +975,13 @@ class StreamProcessor(proc_base.BaseProcessor):
 class CollectProcessor(proc_base.BaseProcessor):
     """Non-stream response processor."""
 
-    def __init__(self, model: str, token: str = "", tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
+    def __init__(self, model: str, token: str = "", tools: List[Dict[str, Any]] = None, tool_choice: Any = None, search_details: str = "none"):
         super().__init__(model, token)
         self.filter_tags = get_config("app.filter_tags")
         self.tools = tools
         self.tool_choice = tool_choice
+        self.search_details = search_details  # 新增：搜索结果显示级别
+        self.tool_usage_results = []  # 新增：收集工具使用结果
 
     def _filter_content(self, content: str) -> str:
         """Filter special tags in content."""
@@ -941,6 +1016,62 @@ class CollectProcessor(proc_base.BaseProcessor):
 
         return result
 
+    def _format_sources_section(self, tool_results: list) -> str:
+        """格式化Sources部分
+
+        根据 search_details 参数决定显示数量：
+        - "none": 不显示，返回空字符串
+        - "medium": X帖子5条，网页5条
+        - "full": 全部显示
+        """
+        if self.search_details == "none":
+            return ""
+
+        from app.services.grok.utils.response import (
+            format_x_search_results,
+            format_web_search_results
+        )
+
+        # 确定最大显示数量
+        max_count = 5 if self.search_details == "medium" else None
+
+        # 收集所有搜索结果
+        all_web_results = []
+        all_x_results = []
+
+        for result in tool_results:
+            # 收集网页搜索结果
+            if "webSearchResults" in result:
+                web_results = result["webSearchResults"].get("results", [])
+                if web_results:
+                    all_web_results.extend(web_results)
+
+            # 收集X搜索结果
+            if "xSearchResults" in result:
+                x_results = result["xSearchResults"].get("results", [])
+                if x_results:
+                    all_x_results.extend(x_results)
+
+        # 格式化结果
+        sections = ["\n\n## Sources:\n"]
+        has_content = False
+
+        # 先处理网页搜索结果（优先显示）
+        if all_web_results:
+            web_md = format_web_search_results(all_web_results, max_count)
+            if web_md:
+                sections.append(web_md)
+                has_content = True
+
+        # 再处理X搜索结果
+        if all_x_results:
+            x_md = format_x_search_results(all_x_results, max_count)
+            if x_md:
+                sections.append(x_md)
+                has_content = True
+
+        return "\n".join(sections) if has_content else ""
+
     async def process(self, response: AsyncIterable[bytes]) -> dict[str, Any]:
         """Process and collect full response."""
         response_id = ""
@@ -968,6 +1099,12 @@ class CollectProcessor(proc_base.BaseProcessor):
                 if mr := resp.get("modelResponse"):
                     response_id = mr.get("responseId", "")
                     content = mr.get("message", "")
+
+                    # 收集 toolUsageResults
+                    if steps := mr.get("steps"):
+                        for step in steps:
+                            if tool_results := step.get("toolUsageResults"):
+                                self.tool_usage_results.extend(tool_results)
 
                     card_map: dict[str, tuple[str, str]] = {}
                     for raw in mr.get("cardAttachmentsJson") or []:
@@ -1065,6 +1202,12 @@ class CollectProcessor(proc_base.BaseProcessor):
             await self.close()
 
         content = self._filter_content(content)
+
+        # 追加sources部分
+        if self.tool_usage_results and self.search_details != "none":
+            sources_md = self._format_sources_section(self.tool_usage_results)
+            if sources_md:
+                content += "\n\n" + sources_md
 
         # Parse for tool calls if tools were provided
         finish_reason = "stop"

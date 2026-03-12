@@ -2,7 +2,7 @@
 Chat Completions API 路由
 """
 
-from typing import Any, AsyncGenerator, AsyncIterable, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, AsyncIterable, Dict, List, Literal, Optional, Union
 import base64
 import binascii
 import time
@@ -60,6 +60,8 @@ class ChatCompletionRequest(BaseModel):
     reasoning_effort: Optional[str] = Field(None, description="推理强度: none/minimal/low/medium/high/xhigh")
     temperature: Optional[float] = Field(0.8, description="采样温度: 0-2")
     top_p: Optional[float] = Field(0.95, description="nucleus 采样: 0-1")
+    # 搜索结果显示控制
+    search_details: Optional[Literal["none", "medium", "full"]] = Field("none", description="搜索结果显示级别: none(不显示)/medium(精简5条)/full(全部显示)")
     # 视频生成配置
     video_config: Optional[VideoConfig] = Field(None, description="视频生成参数")
     # 图片生成配置
@@ -846,6 +848,7 @@ async def chat_completions(request: ChatCompletionRequest):
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
+                search_details=request.search_details,  # 新增：传递搜索结果显示级别
             )
         except Exception as e:
             if request.stream is not False:
